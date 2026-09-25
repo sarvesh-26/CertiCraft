@@ -1,321 +1,397 @@
 # Bulk Certificate Generator
 
-A Python/FastAPI backend for generating participant certificates in bulk from a certificate template and CSV participant data.
+A Python/FastAPI backend that lets an organization generate certificates for many participants at once.
 
-This version is intentionally **Docker-free for local development**: it uses SQLite for persistence and FastAPI `BackgroundTasks` for asynchronous certificate generation. No PostgreSQL, Redis, Celery, WSL, or Docker installation is required to run the project.
+The basic flow is:
 
-## Assignment requirements covered
+1. Upload a certificate template.
+2. Upload participant details as a CSV.
+3. Create a certificate generation job.
+4. The certificates are generated in the background.
+5. Check the job progress.
+6. Download the generated certificates.
 
-- JWT authentication and authenticated resource ownership.
-- Certificate template upload and validation.
-- Bulk participant CSV upload and validation.
-- Asynchronous/background certificate generation.
-- Job lifecycle and progress tracking: `queued` → `processing` → `completed` / `completed_with_errors` / `failed`.
-- Per-certificate success/failure status.
-- Generated PDF download.
-- Database persistence with SQLAlchemy.
-- Failure isolation so one bad participant does not discard the entire batch.
-- Batch-size validation for larger inputs.
-- Automated tests for API and CSV validation.
-- Sample template and participant data.
-- OpenAPI/Swagger documentation through FastAPI.
-- Clear assumptions, trade-offs, limitations, and future improvements.
+I built this as a backend-focused take-home assignment, keeping the setup simple so it can be run locally without Docker.
 
-## Architecture
+---
+
+## Tech Stack
+
+- Python 3.11+
+- FastAPI
+- SQLite
+- SQLAlchemy
+- JWT authentication
+- BackgroundTasks
+- Pillow
+- ReportLab
+- Pytest
+
+For local development, the project does **not** require Docker, PostgreSQL, Redis, Celery, or WSL.
+
+---
+
+## How it works
+
+The application has three main parts:
 
 ```text
-                 ┌──────────────────────┐
-                 │       Client         │
-                 │ Swagger / Postman    │
-                 └──────────┬───────────┘
-                            │ HTTP
-                            ▼
-                 ┌──────────────────────┐
-                 │       FastAPI        │
-                 │ Auth + validation    │
-                 └──────────┬───────────┘
-                            │
-                ┌───────────┴────────────┐
-                ▼                        ▼
-        ┌───────────────┐       ┌─────────────────┐
-        │    SQLite     │       │ BackgroundTasks │
-        │ users/jobs/   │       │ certificate     │
-        │ certificates  │       │ generation      │
-        └───────────────┘       └────────┬────────┘
-                                         │
-                                         ▼
-                               ┌──────────────────┐
-                               │ Local file store │
-                               │ templates + PDFs │
-                               └──────────────────┘
+                Client / Swagger
+                       |
+                       v
+                 FastAPI API
+                  /       \
+                 /         \
+                v           v
+           SQLite DB    Background Task
+                            |
+                            v
+                    Certificate Generator
+                            |
+                            v
+                       PDF Files
 ```
+Request flow
+1. A user registers and logs in.
+2. The API returns a JWT token.
+3. The user uploads a certificate template.
+4. The user uploads participant information as a CSV.
+5. A generation job is created.
+6. The API returns the job ID immediately instead of making the user wait for all certificates.
+7. Certificate generation runs in the background.
+8. The job keeps track of how many certificates succeeded or failed.
+9. Once the job is complete, the generated certificates can be listed and downloaded.
+Main Features
+Authentication
+- User registration
+- Login with email and password
+- JWT-based authentication
+- Protected APIs
+- Users can only access their own jobs and certificates
+Certificate Templates
+- Upload PNG/JPEG certificate templates
+- Validate uploaded files
+- Store templates locally
+Bulk Generation
+- Upload participant data using CSV
+- Validate the CSV before creating a job
+- Generate certificates in the background
+- Track progress while the job is running
+- Continue processing even if one participant fails
+Certificate Output
+- Generate PDF certificates
+- Track individual certificate status
+- Download completed certificates
+API Endpoints
+Authentication
+POST /auth/register
+POST /auth/login
 
-### Request flow
+Templates
+POST /templates
 
-1. User registers/logs in and receives a JWT.
-2. Authenticated user uploads a PNG/JPEG certificate template.
-3. User uploads a CSV and creates a generation job. The CSV is validated before the job is created.
-4. The API persists the job and source CSV, then schedules the generation function as a FastAPI background task and immediately returns `202 Accepted`.
-5. The background worker processes participants and updates job/certificate progress in SQLite.
-6. The client polls `GET /jobs/{job_id}` until a terminal state is reached.
-7. The client lists generated certificates and downloads individual PDFs.
+Upload a certificate template.
+Jobs
+POST /jobs
+GET  /jobs/{job_id}
+GET  /jobs/{job_id}/certificates
+GET  /jobs/{job_id}/certificates/{certificate_id}/download
 
-## Why FastAPI + SQLite + BackgroundTasks?
+Health
+GET /health
 
-- **FastAPI:** request validation, dependency injection, automatic OpenAPI documentation, and a clean Python API.
-- **SQLite:** zero-configuration local database that makes the assignment immediately runnable on a Windows laptop without Docker or a separately installed database server.
-- **BackgroundTasks:** keeps long-running certificate generation out of the request/response path while avoiding Redis/Celery infrastructure for a take-home assignment.
-- **Local filesystem:** intentionally simple. Generated files and templates are stored under `storage/`.
-
-The implementation deliberately avoids Kubernetes, Kafka, Redis, Celery, and a separate frontend because those technologies are not necessary to demonstrate the core backend design and would make local evaluation substantially harder.
-
-### Production trade-off
-
-FastAPI `BackgroundTasks` is an in-process background mechanism. A process crash/restart can interrupt a running job. For a production deployment, the background layer should be replaced with a durable queue such as Celery/RQ/SQS and Redis/RabbitMQ/SQS-backed delivery, together with a transactional outbox or another durable handoff. The API/data model is intentionally kept compatible with that evolution.
-
-## Data model
-
-### `users`
-`id`, `email`, `password_hash`, `role`, `created_at`
-
-### `templates`
-`id`, `name`, `filename`, `content_type`, `created_by`, `created_at`
-
-### `generation_jobs`
-`id`, `template_id`, `created_by`, `status`, `total`, `processed`, `succeeded`, `failed`, `error_message`, timestamps
-
-### `certificates`
-`id`, `job_id`, `participant_id`, `participant_name`, `email`, `status`, `file_path`, `error_message`, `created_at`
-
-## API
-
-### Authentication
-
-- `POST /auth/register`
-- `POST /auth/login`
-
-### Templates
-
-- `POST /templates` — multipart form: `name`, `file`
-
-### Generation jobs
-
-- `POST /jobs` — multipart form: `template_id`, `participants`
-- `GET /jobs/{job_id}` — status/progress
-- `GET /jobs/{job_id}/certificates` — generated/failed certificate records
-- `GET /jobs/{job_id}/certificates/{certificate_id}/download` — PDF download
-
-### Health
-
-- `GET /health`
-
-Interactive API docs:
-
-`http://127.0.0.1:8000/docs`
-
-## CSV contract
-
-Required headers:
-
-```csv
-participant_id,name,email
-P001,Aarav Sharma,aarav@example.com
-```
-
-The API rejects missing required columns, missing required values, empty batches, invalid UTF-8, and batches larger than `MAX_BATCH_SIZE`.
-
-## Windows setup — no Docker required
-
-### Prerequisites
-
-- Python 3.11+ recommended.
-- Git (only needed if cloning the repository).
-- No Docker, WSL, PostgreSQL, Redis, or Celery installation is required.
-
-### Option A — one command
-
-Open PowerShell in the repository folder and run:
-
-```powershell
+Running the Project
+Requirements
+You only need:
+- Python 3.11+
+- Git (if cloning the repository)
+You do not need:
+- Docker
+- PostgreSQL
+- Redis
+- Celery
+- WSL
+Option 1: Run using the PowerShell script
+Open PowerShell in the project folder:
 .\run.ps1
-```
 
-The script creates `.venv`, installs dependencies, creates `.env`, and starts Uvicorn.
-
-If PowerShell blocks local scripts, use Option B below instead.
-
-### Option B — manual setup
-
-```powershell
+This will:
+- Create the virtual environment
+- Install the required packages
+- Create the .env file
+- Start the FastAPI application
+If PowerShell doesn't allow the script to run, use Option 2.
+Option 2: Run manually
+Create a virtual environment:
 py -m venv .venv
+
+Activate it:
 .\.venv\Scripts\Activate.ps1
+
+Install dependencies:
 python -m pip install --upgrade pip
 pip install -r requirements.txt
+
+Create the environment file:
 Copy-Item .env.example .env
+
+Start the application:
 uvicorn app.main:app --reload
-```
 
-If `Copy-Item` says `.env` already exists, that's fine.
+The API will be available at:
+http://127.0.0.1:8000
 
-Open:
+Swagger documentation:
+http://127.0.0.1:8000/docs
 
-`http://127.0.0.1:8000/docs`
+Running the Demo
+The easiest way to test the application is through Swagger.
+1. Register
+Use:
+POST /auth/register
 
-## Demo sequence
+Example:
+{
+  "email": "demo@example.com",
+  "password": "StrongPass123!"
+}
 
-1. Register a user.
-2. Login and obtain the JWT.
-3. Click **Authorize** in Swagger and provide the bearer token.
-4. Upload `samples/certificate_template.png` through `POST /templates`.
-5. Upload `samples/participants.csv` through `POST /jobs` with the returned template ID.
-6. The API immediately returns a job with status `queued`/`processing`.
-7. Poll `GET /jobs/{job_id}` and observe `processed`, `succeeded`, and `failed` counters.
-8. When complete, call `GET /jobs/{job_id}/certificates`.
-9. Download a generated PDF from the returned download endpoint.
+2. Login
+Use:
+POST /auth/login
 
-### Example registration
+Copy the returned JWT token.
+3. Authorize Swagger
+Click the Authorize button at the top of Swagger and enter the token.
+4. Upload the certificate template
+Use:
+POST /templates
 
-```powershell
-curl.exe -X POST http://127.0.0.1:8000/auth/register `
-  -H "Content-Type: application/json" `
-  -d '{"email":"demo@example.com","password":"StrongPass123!"}'
-```
+Sample template:
+samples/certificate_template.png
 
-### Example login
+Save the template ID returned by the API.
+5. Create a generation job
+Use:
+POST /jobs
 
-```powershell
-curl.exe -X POST http://127.0.0.1:8000/auth/login `
-  -H "Content-Type: application/json" `
-  -d '{"email":"demo@example.com","password":"StrongPass123!"}'
-```
+Upload:
+samples/participants.csv
 
-For the rest of the demo, Swagger is recommended because multipart file uploads and bearer authorization are easier to use there.
+and provide the template ID.
+The API returns a job ID and does not wait for all certificates to finish.
+For example:
+{
+  "id": 1,
+  "status": "queued",
+  "total": 5,
+  "processed": 0,
+  "succeeded": 0,
+  "failed": 0
+}
 
-## Testing
+6. Check the job
+Use:
+GET /jobs/{job_id}
 
-Activate the virtual environment first:
+You can keep checking this endpoint to see the progress.
+Possible job states are:
+queued
+processing
+completed
+completed_with_errors
+failed
 
-```powershell
-.\.venv\Scripts\Activate.ps1
-```
+7. View generated certificates
+Use:
+GET /jobs/{job_id}/certificates
 
-Then:
+8. Download a certificate
+Use:
+GET /jobs/{job_id}/certificates/{certificate_id}/download
 
-```powershell
+CSV Format
+The sample CSV is available at:
+samples/participants.csv
+
+The required columns are:
+participant_id,name,email
+P001,Aarav Sharma,aarav@example.com
+P002,Ananya Rao,ananya@example.com
+
+The API checks for:
+- Required columns
+- Required values
+- Valid UTF-8 CSV
+- Empty files/batches
+- Maximum batch size
+Why I chose this approach
+FastAPI
+I chose FastAPI because it provides:
+- Simple API development
+- Request validation
+- Dependency injection
+- JWT authentication support
+- Automatic Swagger/OpenAPI documentation
+- Good performance for this type of backend
+SQLite
+For this assignment, I wanted the project to be easy for someone else to run.
+SQLite means there is no need to install or configure a separate database server.
+For a production application, I would move this to PostgreSQL.
+BackgroundTasks
+Certificate generation can take time when there are many participants.
+Instead of keeping the HTTP request open until every certificate is finished, the API creates a job and starts the generation in the background.
+This allows the API to return quickly with a job ID.
+For a production system with multiple workers and higher reliability requirements, I would use a proper task queue such as Celery/RQ with Redis, RabbitMQ, or a cloud queue.
+Local file storage
+Templates and generated PDFs are stored locally under:
+storage/
+
+This keeps the assignment simple.
+For production, I would use something like S3 or another object-storage service.
+Handling Failures
+I tried to keep failures isolated.
+For example, if one participant has bad data or their certificate cannot be generated, the entire batch should not have to fail.
+Each certificate has its own status and error information.
+A job can therefore finish as:
+completed
+
+or:
+completed_with_errors
+
+depending on what happened during processing.
+Unexpected job-level errors result in:
+failed
+
+Database
+The main tables are:
+Users
+Stores:
+- User ID
+- Email
+- Password hash
+- Role
+- Created date
+Templates
+Stores:
+- Template ID
+- Name
+- File information
+- Owner
+- Created date
+Generation Jobs
+Stores:
+- Job ID
+- Template
+- Owner
+- Status
+- Total participants
+- Processed count
+- Successful count
+- Failed count
+- Error information
+Certificates
+Stores:
+- Certificate ID
+- Job ID
+- Participant information
+- Status
+- Generated file path
+- Error information
+Testing
+Run:
 pytest -q
-```
 
-The test suite covers health/authentication smoke paths and CSV validation. A larger production suite should additionally cover worker recovery, authorization boundaries, malformed images, download security, and end-to-end generation.
+The tests cover the main API/authentication flow and CSV validation.
+For a production system, I would add more tests around:
+- Authorization boundaries
+- Background worker failures
+- Large CSV files
+- Invalid images
+- File download security
+- Full end-to-end generation
+Important Assumptions
+A few assumptions were made because the assignment leaves some implementation details open:
+1. The certificate template is a PNG/JPEG image.
+2. Participant information is provided as CSV.
+3. Each participant row represents one certificate.
+4. Participant email is stored for possible future email delivery.
+5. Email sending itself is outside the scope of this assignment.
+6. The authenticated user who creates a job owns its certificates.
+7. Local file storage is acceptable for the take-home assignment.
+Known Limitations
+There are a few things I would improve for a production version:
+- Certificate text positioning is currently fixed.
+- Files are stored locally.
+- SQLite is intended for local/demo use.
+- Background tasks are not durable if the application crashes.
+- There is no email delivery.
+- There is no admin dashboard.
+- Job progress currently uses polling.
+- Certificate generation is processed serially.
+What I Would Improve for Production
+If this system had to support much larger workloads, I would consider:
+- PostgreSQL instead of SQLite
+- Celery/RQ or a cloud queue for background jobs
+- Redis/RabbitMQ/SQS
+- S3-compatible object storage
+- Multiple certificate workers
+- Chunked CSV processing
+- Idempotency keys
+- Duplicate participant detection
+- SSE/WebSockets for real-time progress
+- Better monitoring and logging
+- Prometheus metrics
+- Distributed tracing
+- Admin/audit dashboard
+- Virus scanning for uploaded files
+I intentionally didn't add all of these to the assignment because I wanted to keep the solution simple and focused on the core requirements.
+Project Structure
 
-## Failure handling and consistency
-
-- Invalid CSV data is rejected before a job is created.
-- A job is persisted before background processing starts.
-- Each certificate has an independent status/error, so one bad participant does not discard the whole batch.
-- Unexpected job-level exceptions mark the job as `failed`.
-- Partial participant failures result in `completed_with_errors` while successful certificates remain downloadable.
-- Job ownership is checked for status, listing, and download operations.
-
-## Performance considerations
-
-- The HTTP request does not synchronously generate all PDFs.
-- The worker reads the stored CSV rather than keeping the upload request open.
-- Batch size is configurable.
-- Certificate generation can be moved to a durable queue and horizontally scaled in production.
-- SQLite is suitable for a local take-home demo, not a high-concurrency production workload.
-
-For very large workloads, production improvements would include chunked CSV processing, bulk database operations, object storage, and multiple durable workers.
-
-## Security considerations
-
-- Passwords are bcrypt-hashed; plaintext passwords are not stored.
-- JWTs expire.
-- Protected resources require authentication.
-- Users can only access their own jobs/certificates.
-- Uploaded templates are limited to PNG/JPEG and validated as actual images.
-- Production deployment should use HTTPS, a strong secret from a secret manager, object-storage signed URLs, rate limiting, malware scanning, and stricter upload/path controls.
-
-## Assumptions
-
-1. The template is a PNG/JPEG background and participant name/certificate ID are overlaid at fixed coordinates.
-2. Each participant row represents one certificate.
-3. Participant email is stored for future delivery integrations; email sending is out of scope.
-4. A certificate is generated when its PDF is successfully written.
-5. Local storage is acceptable for the take-home demo.
-6. The authenticated user who creates a job owns the resulting certificates.
-
-## Known limitations
-
-- Template positioning is fixed rather than user-configurable.
-- Local filesystem storage is not suitable for multi-host production deployments.
-- No email delivery is implemented.
-- No admin UI is included.
-- In-process background tasks are not durable across process crashes/restarts.
-- Polling is used for job progress; WebSockets/SSE are intentionally omitted.
-- The sample implementation generates PDFs serially within a background task.
-
-## Future improvements
-
-- PostgreSQL + Alembic migrations for production persistence.
-- Redis/RabbitMQ/SQS + Celery/RQ for durable background processing.
-- S3-compatible object storage with signed download URLs.
-- Configurable template placeholders and a template editor.
-- Chunked jobs and controlled worker concurrency.
-- Transactional outbox/event delivery.
-- Idempotency keys and duplicate participant detection.
-- SSE/WebSocket progress updates.
-- Admin/audit dashboard and role-based permissions.
-- Prometheus metrics, structured logging, tracing, and alerting.
-- Virus scanning and stronger upload/content-disposition hardening.
-
-## Repository structure
-
-```text
+```text 
 bulk-certificate-generator/
+│
 ├── app/
-│   ├── api/                 # HTTP routes
-│   ├── core/                # settings and security dependencies
-│   ├── db/                  # SQLAlchemy engine/session
-│   ├── models/              # database models
-│   ├── schemas/             # request/response schemas
-│   ├── services/            # CSV and PDF generation logic
-│   ├── tasks/               # background job implementation
-│   └── main.py              # FastAPI application
+│   ├── api/              # API routes
+│   ├── core/             # Settings and security
+│   ├── db/               # Database setup
+│   ├── models/           # Database models
+│   ├── schemas/          # Request/response schemas
+│   ├── services/         # CSV and certificate generation
+│   ├── tasks/            # Background processing
+│   └── main.py           # FastAPI application
+│
 ├── samples/
 │   ├── certificate_template.png
 │   └── participants.csv
+│
 ├── tests/
+│
 ├── .env.example
+├── .gitignore
 ├── requirements.txt
-├── run.ps1                  # Windows one-command launcher
-├── run.bat                  # Windows CMD launcher
-├── Dockerfile               # optional production/container packaging
-├── docker-compose.yml       # optional container deployment
-├── Makefile
-└── README.md
+├── run.ps1
+├── run.bat
+├── README.md
+└── ...
+
 ```
+AI Usage
+AI tools were used during development for:
+- Brainstorming the architecture
+- Getting implementation ideas
+- Debugging issues
+- Writing some initial code
+- Improving documentation
+- Suggesting test cases
+I reviewed and tested the implementation myself and used AI as a development aid rather than as a replacement for understanding the code.
 
-## AI usage disclosure
 
-AI tools were used during development to assist with architecture brainstorming, implementation scaffolding, documentation, and test-case suggestions. The submitted design and code should be reviewed and understood by the author before submission; AI output was treated as development assistance rather than a substitute for engineering judgment.
+Author
+Built as a backend engineering take-home assignment.
 
-## Submission checklist
+### Why I prefer this version
 
-- [x] Complete Python backend source code
-- [x] FastAPI framework
-- [x] Authentication/authorization
-- [x] Template upload and validation
-- [x] Bulk participant CSV upload and validation
-- [x] Background/asynchronous processing
-- [x] Generation status/progress
-- [x] PDF certificate output
-- [x] Failure handling and per-certificate status
-- [x] Database persistence
-- [x] Tests
-- [x] Sample template and participant CSV
-- [x] Setup instructions
-- [x] Architecture overview
-- [x] Assumptions and trade-offs
-- [x] Known limitations
-- [x] Future improvements
-- [x] AI disclosure
+The original is technically solid, but phrases like **“transactional outbox,” “durable handoff,” “horizontally scaled,”** etc. make it sound more like something generated for a system-design document than a developer explaining their own take-home project. The revised version keeps those ideas where they matter, but explains them in plain language. The original architecture and trade-offs are still preserved. :chatgpt-content-reference{index="1"}
+
+**I would use this version for your GitHub README.** It will be easier for the reviewer to scan and, more importantly, easier for **you to explain during the interview**.
